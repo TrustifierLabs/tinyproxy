@@ -1,0 +1,1 @@
+./configure --enable-upstream --enable-reverse --enable-filter --enable-debug
