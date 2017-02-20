@@ -1500,11 +1500,11 @@ void handle_connection (int fd)
                                 header->value, strlen (header->value) + 1);
         }
 
-	// modify the user-agent to pretend to be Linux
+	/* modify the user-agent to pretend to be Linux */
 	char *oldua = NULL;
 	char newua[500];
 	hashmap_entry_by_key (hashofheaders, "User-Agent",oldua);
-	if(strlen(oldua)<400) { // if the user-agent is too long, give up
+	if(strlen(oldua)<400) { /* if the user-agent is too long, give up */
 		linuxify(oldua,newua);
 		hashmap_remove (hashofheaders, "User-Agent");
 		hashmap_insert (hashofheaders, "User-Agent", newua, strlen(newua)+1 );
