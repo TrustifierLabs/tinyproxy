@@ -1393,11 +1393,11 @@ get_request_entity(struct conn_s *connptr)
 /* function to modify user-agent string to pretend to be Linux */
 void linuxify (const char *oldua, char *newua)
 {
-	// replace the first occurance of (Windows*) or (Macintosh*) to (X11; Linux x86_64)
+	/* replace the first occurance of (Windows*) or (Macintosh*) to (X11; Linux x86_64) */
 	const char *linuxua = "(X11; Linux x86_64)";
 	while( (*newua++ = *oldua++) && *oldua != '(' );
 	strcpy(newua,linuxua);
-	while(*old && *old++ != ')');
+	while(*oldua && *oldua++ != ')');
 	newua += strlen(newua);
 	if(*oldua)
 		strcpy(newua,oldua);
