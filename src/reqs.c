@@ -1390,17 +1390,17 @@ get_request_entity(struct conn_s *connptr)
         return ret;
 }
 
-// function to modify user-agent string to pretend to be Linux
-void linuxify (const char *old, char *new)
+/* function to modify user-agent string to pretend to be Linux */
+void linuxify (const char *oldua, char *newua)
 {
 	// replace the first occurance of (Windows*) or (Macintosh*) to (X11; Linux x86_64)
 	const char *linuxua = "(X11; Linux x86_64)";
-	while( (*new++ = *old++) && *old != '(' );
-	strcpy(new,linuxua);
+	while( (*newua++ = *oldua++) && *oldua != '(' );
+	strcpy(newua,linuxua);
 	while(*old && *old++ != ')');
-	new += strlen(new);
-	if(*old)
-		strcpy(new,old);
+	newua += strlen(newua);
+	if(*oldua)
+		strcpy(newua,oldua);
 }
 
 /*
@@ -1501,9 +1501,9 @@ void handle_connection (int fd)
         }
 
 	/* modify the user-agent to pretend to be Linux */
-	char *oldua = NULL;
+	char *oldua;
 	char newua[500];
-	hashmap_entry_by_key (hashofheaders, "User-Agent",oldua);
+	hashmap_entry_by_key (hashofheaders, "User-Agent",&oldua);
 	if(strlen(oldua)<400) { /* if the user-agent is too long, give up */
 		linuxify(oldua,newua);
 		hashmap_remove (hashofheaders, "User-Agent");
