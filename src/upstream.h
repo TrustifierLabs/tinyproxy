@@ -26,6 +26,7 @@
 #define _TINYPROXY_UPSTREAM_H_
 
 #include "common.h"
+typedef enum {HTTP_TYPE, SOCKS4_TYPE, SOCKS5_TYPE} proxy_type;
 
 /*
  * Even if upstream support is not compiled into tinyproxy, this
@@ -37,11 +38,14 @@ struct upstream {
         char *host;
         int port;
         in_addr_t ip, mask;
+
+        proxy_type type;
 };
 
 #ifdef UPSTREAM_SUPPORT
+const char *proxy_type_name(proxy_type type);
 extern void upstream_add (const char *host, int port, const char *domain,
-                          struct upstream **upstream_list);
+                          proxy_type type, struct upstream **upstream_list);
 extern struct upstream *upstream_get (char *host, struct upstream *up);
 extern void free_upstream_list (struct upstream *up);
 #endif /* UPSTREAM_SUPPORT */

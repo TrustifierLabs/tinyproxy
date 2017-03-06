@@ -160,6 +160,8 @@ static HANDLE_FUNC (handle_xtinyproxy);
 
 #ifdef UPSTREAM_SUPPORT
 static HANDLE_FUNC (handle_upstream);
+static HANDLE_FUNC (handle_upstream4);
+static HANDLE_FUNC (handle_upstream5);
 static HANDLE_FUNC (handle_upstream_no);
 #endif
 
@@ -256,6 +258,14 @@ struct {
         {
                 BEGIN "(upstream)" WS "(" IP "|" ALNUM ")" ":" INT "(" WS STR
                       ")?" END, handle_upstream, NULL
+        },
+        {
+                BEGIN "(upstream4)" WS "(" IP "|" ALNUM ")" ":" INT "(" WS STR
+                      ")?" END, handle_upstream4, NULL
+        },
+        {
+                BEGIN "(upstream5)" WS "(" IP "|" ALNUM ")" ":" INT "(" WS STR
+                      ")?" END, handle_upstream5, NULL
         },
 #endif
         /* loglevel */
@@ -380,7 +390,7 @@ static int check_match (struct config_s *conf, const char *line)
         for (i = 0; i != ndirectives; ++i) {
                 assert (directives[i].cre);
                 if (!regexec
-                    (directives[i].cre, line, RE_MAX_MATCHES, match, 0))
+                        (directives[i].cre, line, RE_MAX_MATCHES, match, 0))
                         return (*directives[i].handler) (conf, line, match);
         }
 
@@ -423,13 +433,13 @@ static int load_config_file (const char *config_fname, struct config_s *conf)
 
         if (config_parse (conf, config_file)) {
                 fprintf (stderr, "Unable to parse config file. "
-                         "Not starting.\n");
+                        "Not starting.\n");
                 goto done;
         }
 
         ret = 0;
 
-done:
+        done:
         if (config_file)
                 fclose (config_file);
 
@@ -564,25 +574,25 @@ int reload_config_file (const char *config_fname, struct config_s *conf,
                  * logging might not be set up yet!
                  */
                 fprintf (stderr, PACKAGE ": You MUST set a Port in the "
-                         "config file.\n");
+                        "config file.\n");
                 ret = -1;
                 goto done;
         }
 
         if (!conf->user) {
                 log_message (LOG_WARNING, "You SHOULD set a UserName in the "
-                             "config file. Using current user instead.");
+                        "config file. Using current user instead.");
         }
 
         if (conf->idletimeout == 0) {
                 log_message (LOG_WARNING, "Invalid idle time setting. "
-                             "Only values greater than zero are allowed. "
-                             "Therefore setting idle timeout to %u seconds.",
+                        "Only values greater than zero are allowed. "
+                        "Therefore setting idle timeout to %u seconds.",
                              MAX_IDLE_TIME);
                 conf->idletimeout = MAX_IDLE_TIME;
         }
 
-done:
+        done:
         return ret;
 }
 
@@ -899,13 +909,13 @@ static HANDLE_FUNC (handle_listen)
         }
 
         if (conf->listen_addrs == NULL) {
-               conf->listen_addrs = vector_create();
-               if (conf->listen_addrs == NULL) {
-                       log_message(LOG_WARNING, "Could not create a list "
-                                   "of listen addresses.");
-                       safefree(arg);
-                       return -1;
-               }
+                conf->listen_addrs = vector_create();
+                if (conf->listen_addrs == NULL) {
+                        log_message(LOG_WARNING, "Could not create a list "
+                                "of listen addresses.");
+                        safefree(arg);
+                        return -1;
+                }
         }
 
         vector_append (conf->listen_addrs, arg, strlen(arg) + 1);
@@ -977,7 +987,7 @@ static struct log_levels_s log_levels[] = {
 static HANDLE_FUNC (handle_loglevel)
 {
         static const unsigned int nlevels =
-            sizeof (log_levels) / sizeof (log_levels[0]);
+                sizeof (log_levels) / sizeof (log_levels[0]);
         unsigned int i;
 
         char *arg = get_string_arg (line, &match[2]);
@@ -1070,7 +1080,8 @@ static HANDLE_FUNC (handle_reversepath)
 #endif
 
 #ifdef UPSTREAM_SUPPORT
-static HANDLE_FUNC (handle_upstream)
+static int _handle_upstream(struct config_s* conf, const char* line,
+           regmatch_t match[], proxy_type type)
 {
         char *ip;
         int port;
@@ -1084,16 +1095,31 @@ static HANDLE_FUNC (handle_upstream)
         if (match[10].rm_so != -1) {
                 domain = get_string_arg (line, &match[10]);
                 if (domain) {
-                        upstream_add (ip, port, domain, &conf->upstream_list);
+                        upstream_add (ip, port, domain, type, &conf->upstream_list);
                         safefree (domain);
                 }
         } else {
-                upstream_add (ip, port, NULL, &conf->upstream_list);
+                upstream_add (ip, port, NULL, type, &conf->upstream_list);
         }
 
         safefree (ip);
 
         return 0;
+}
+
+static HANDLE_FUNC (handle_upstream)
+{
+	return _handle_upstream(conf, line, match, HTTP_TYPE);
+}
+
+static HANDLE_FUNC (handle_upstream4)
+{
+	return _handle_upstream(conf, line, match, SOCKS4_TYPE);
+}
+
+static HANDLE_FUNC (handle_upstream5)
+{
+	return _handle_upstream(conf, line, match, SOCKS5_TYPE);
 }
 
 static HANDLE_FUNC (handle_upstream_no)
@@ -1104,7 +1130,7 @@ static HANDLE_FUNC (handle_upstream_no)
         if (!domain)
                 return -1;
 
-        upstream_add (NULL, 0, domain, &conf->upstream_list);
+        upstream_add (NULL, 0, domain, HTTP_TYPE, &conf->upstream_list);
         safefree (domain);
 
         return 0;
