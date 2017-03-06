@@ -49,7 +49,9 @@ tinyproxy_SOURCES = \
 	upstream.c upstream.h \
 	connect-ports.c connect-ports.h
 
-EXTRA_tinyproxy_SOURCES = filter.c filter.h \
+EXTRA_tinyproxy_SOURCES = \
+	auth.c auth.h \
+	filter.c filter.h \
 	reverse-proxy.c reverse-proxy.h \
 	transparent-proxy.c transparent-proxy.h
 tinyproxy_DEPENDENCIES = @ADDITIONAL_OBJECTS@

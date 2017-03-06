@@ -26,6 +26,7 @@
 #include "conf.h"
 
 #include "acl.h"
+#include "auth.h"
 #include "anonymous.h"
 #include "child.h"
 #include "filter.h"
@@ -77,6 +78,7 @@
 #define IPV6MASK "(" IPV6 "(/[[:digit:]]+)?)"
 #define BEGIN "^[[:space:]]*"
 #define END "[[:space:]]*$"
+#define AUTH "\"([^\"]+:[^\"]+)\""
 
 /*
  * Limit the maximum number of substring matches to a reasonably high
@@ -116,6 +118,9 @@ static HANDLE_FUNC (handle_nop)
 }                               /* do nothing function */
 
 static HANDLE_FUNC (handle_allow);
+#ifdef AUTHORIZATION_ENABLE
+static HANDLE_FUNC (handle_auth);
+#endif
 static HANDLE_FUNC (handle_anonymous);
 static HANDLE_FUNC (handle_bind);
 static HANDLE_FUNC (handle_bindsame);
@@ -232,6 +237,11 @@ struct {
         /* other */
         STDCONF ("errorfile", INT WS STR, handle_errorfile),
         STDCONF ("addheader",  STR WS STR, handle_addheader),
+
+#ifdef AUTHORIZATION_ENABLE
+        /* authorization */
+        STDCONF ("auth", AUTH, handle_auth),
+#endif
 
 #ifdef FILTER_ENABLE
         /* filtering */
@@ -872,6 +882,17 @@ static HANDLE_FUNC (handle_deny)
         safefree (arg);
         return 0;
 }
+
+#ifdef AUTHORIZATION_ENABLE
+static HANDLE_FUNC (handle_auth)
+{
+        char *arg = get_string_arg (line, &match[2]);
+
+        insert_auth (arg, &conf->auth_table);
+        safefree (arg);
+        return 0;
+}
+#endif
 
 static HANDLE_FUNC (handle_bind)
 {

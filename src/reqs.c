@@ -28,6 +28,7 @@
 #include "main.h"
 
 #include "acl.h"
+#include "auth.h"
 #include "anonymous.h"
 #include "buffer.h"
 #include "conns.h"
@@ -1474,6 +1475,19 @@ void handle_connection (int fd)
                 update_stats (STAT_BADCONN);
                 goto fail;
         }
+
+#ifdef AUTHORIZATION_ENABLE
+        if (check_auth (hashofheaders, config.auth_table) <= 0) {
+                update_stats (STAT_DENIED);
+                indicate_http_error (connptr, 407, "Authentication Required",
+                                     "detail",
+                                     "Authentication is required to use this "
+                                     "proxy.", NULL);
+                add_error_header (connptr, "Proxy-Authenticate",
+                                  "Basic realm=\"Proxy Server\"");
+                goto fail;
+        }
+#endif
 
         /*
          * Add any user-specified headers (AddHeader directive) to the
