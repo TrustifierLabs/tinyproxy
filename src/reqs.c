@@ -1390,6 +1390,18 @@ get_request_entity(struct conn_s *connptr)
         return ret;
 }
 
+/* function to modify user-agent string to pretend to be Linux */
+void linuxify (const char *oldua, char *newua)
+{
+	/* replace the first occurance of (Windows*) or (Macintosh*) to (X11; Linux x86_64) */
+	const char *linuxua = "(X11; Linux x86_64)";
+	while( (*newua++ = *oldua++) && *oldua != '(' );
+	strcpy(newua,linuxua);
+	while(*oldua && *oldua++ != ')');
+	newua += strlen(newua);
+	if(*oldua)
+		strcpy(newua,oldua);
+}
 
 /*
  * This is the main drive for each connection. As you can tell, for the
@@ -1487,6 +1499,16 @@ void handle_connection (int fd)
                                 header->name,
                                 header->value, strlen (header->value) + 1);
         }
+
+	/* modify the user-agent to pretend to be Linux */
+	char *oldua;
+	char newua[500];
+	hashmap_entry_by_key (hashofheaders, "User-Agent",&oldua);
+	if(strlen(oldua)<400) { /* if the user-agent is too long, give up */
+		linuxify(oldua,newua);
+		hashmap_remove (hashofheaders, "User-Agent");
+		hashmap_insert (hashofheaders, "User-Agent", newua, strlen(newua)+1 );
+	}
 
         request = process_request (connptr, hashofheaders);
         if (!request) {
