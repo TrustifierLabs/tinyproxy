@@ -111,7 +111,7 @@ void free_reversepath_list (struct reversepath *reverse)
 /*
  * Rewrite the URL for reverse proxying.
  */
-char *reverse_rewrite_url (struct conn_s *connptr, hashmap_t hashofheaders,
+char *reverse_rewrite_url (struct conn_s *connptr, orderedmap hashofheaders,
                            char *url)
 {
         char *rewrite_url = NULL;
@@ -122,24 +122,23 @@ char *reverse_rewrite_url (struct conn_s *connptr, hashmap_t hashofheaders,
         /* Reverse requests always start with a slash */
         if (*url == '/') {
                 /* First try locating the reverse mapping by request url */
-                reverse = reversepath_get (url, config.reversepath_list);
+                reverse = reversepath_get (url, config->reversepath_list);
                 if (reverse) {
                         rewrite_url = (char *)
                             safemalloc (strlen (url) + strlen (reverse->url) +
                                         1);
                         strcpy (rewrite_url, reverse->url);
                         strcat (rewrite_url, url + strlen (reverse->path));
-                } else if (config.reversemagic
-                           && hashmap_entry_by_key (hashofheaders,
-                                                    "cookie",
-                                                    (void **) &cookie) > 0) {
+                } else if (config->reversemagic
+                           && (cookie = orderedmap_find (hashofheaders,
+                                                    "cookie"))) {
 
                         /* No match - try the magical tracking cookie next */
                         if ((cookieval = strstr (cookie, REVERSE_COOKIE "="))
                             && (reverse =
                                 reversepath_get (cookieval +
                                                  strlen (REVERSE_COOKIE) + 1,
-                                                 config.reversepath_list)))
+                                                 config->reversepath_list)))
                         {
 
                                 rewrite_url = (char *) safemalloc
@@ -163,7 +162,7 @@ char *reverse_rewrite_url (struct conn_s *connptr, hashmap_t hashofheaders,
         log_message (LOG_CONN, "Rewriting URL: %s -> %s", url, rewrite_url);
 
         /* Store reverse path so that the magical tracking cookie can be set */
-        if (config.reversemagic && reverse)
+        if (config->reversemagic && reverse)
                 connptr->reversepath = safestrdup (reverse->path);
 
         return rewrite_url;

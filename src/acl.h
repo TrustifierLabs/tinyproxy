@@ -21,14 +21,16 @@
 #ifndef TINYPROXY_ACL_H
 #define TINYPROXY_ACL_H
 
-#include "vector.h"
+#include "sblist.h"
+#include "sock.h"
 
 typedef enum { ACL_ALLOW, ACL_DENY } acl_access_t;
+typedef sblist* acl_list_t;
 
 extern int insert_acl (char *location, acl_access_t access_type,
-                       vector_t *access_list);
-extern int check_acl (const char *ip_address, const char *string_address,
-                      vector_t access_list);
-extern void flush_access_list (vector_t access_list);
+                       acl_list_t *access_list);
+extern int check_acl (const char *ip_address, union sockaddr_union *addr,
+                      acl_list_t access_list);
+extern void flush_access_list (acl_list_t access_list);
 
 #endif

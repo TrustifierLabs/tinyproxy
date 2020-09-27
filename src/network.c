@@ -32,10 +32,11 @@
  * Write the buffer to the socket. If an EINTR occurs, pick up and try
  * again. Keep sending until the buffer has been sent.
  */
-ssize_t safe_write (int fd, const char *buffer, size_t count)
+ssize_t safe_write (int fd, const void *buf, size_t count)
 {
         ssize_t len;
         size_t bytestosend;
+	const char *buffer = buf;
 
         assert (fd >= 0);
         assert (buffer != NULL);
@@ -67,7 +68,7 @@ ssize_t safe_write (int fd, const char *buffer, size_t count)
  * Matched pair for safe_write(). If an EINTR occurs, pick up and try
  * again.
  */
-ssize_t safe_read (int fd, char *buffer, size_t count)
+ssize_t safe_read (int fd, void *buffer, size_t count)
 {
         ssize_t len;
 
@@ -249,8 +250,10 @@ CLEANUP:
  * Convert the network address into either a dotted-decimal or an IPv6
  * hex string.
  */
-char *get_ip_string (struct sockaddr *sa, char *buf, size_t buflen)
+const char *get_ip_string (struct sockaddr *sa, char *buf, size_t buflen)
 {
+        const char *result;
+
         assert (sa != NULL);
         assert (buf != NULL);
         assert (buflen != 0);
@@ -261,7 +264,8 @@ char *get_ip_string (struct sockaddr *sa, char *buf, size_t buflen)
                 {
                         struct sockaddr_in *sa_in = (struct sockaddr_in *) sa;
 
-                        inet_ntop (AF_INET, &sa_in->sin_addr, buf, buflen);
+                        result = inet_ntop (AF_INET, &sa_in->sin_addr, buf,
+                                            buflen);
                         break;
                 }
         case AF_INET6:
@@ -269,7 +273,8 @@ char *get_ip_string (struct sockaddr *sa, char *buf, size_t buflen)
                         struct sockaddr_in6 *sa_in6 =
                             (struct sockaddr_in6 *) sa;
 
-                        inet_ntop (AF_INET6, &sa_in6->sin6_addr, buf, buflen);
+                        result = inet_ntop (AF_INET6, &sa_in6->sin6_addr, buf,
+                                            buflen);
                         break;
                 }
         default:
@@ -277,7 +282,7 @@ char *get_ip_string (struct sockaddr *sa, char *buf, size_t buflen)
                 return NULL;
         }
 
-        return buf;
+        return result;
 }
 
 /*

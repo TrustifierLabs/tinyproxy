@@ -22,8 +22,9 @@
 #ifndef TINYPROXY_CONF_H
 #define TINYPROXY_CONF_H
 
-#include "hashmap.h"
-#include "vector.h"
+#include "hsearch.h"
+#include "sblist.h"
+#include "acl.h"
 
 /*
  * Stores a HTTP header created using the AddHeader directive.
@@ -37,16 +38,16 @@ typedef struct {
  * Hold all the configuration time information.
  */
 struct config_s {
+        sblist *basicauth_list;
         char *logf_name;
-        char *config_file;
         unsigned int syslog;    /* boolean */
         unsigned int port;
         char *stathost;
-        unsigned int godaemon;  /* boolean */
         unsigned int quit;      /* boolean */
+        unsigned int maxclients;
         char *user;
         char *group;
-        vector_t listen_addrs;
+        sblist *listen_addrs;
 #ifdef FILTER_ENABLE
         char *filter;
         unsigned int filter_url;        /* boolean */
@@ -80,7 +81,7 @@ struct config_s {
         /*
          * Error page support.  Map error numbers to file paths.
          */
-        hashmap_t errorpages;
+        struct htab *errorpages;
 
         /*
          * Error page to be displayed if appropriate page cannot be located
@@ -93,28 +94,28 @@ struct config_s {
          */
         char *statpage;
 
-        vector_t access_list;
+        acl_list_t access_list;
 
         /*
          * Store the list of port allowed by CONNECT.
          */
-        vector_t connect_ports;
+        sblist *connect_ports;
 
         /*
          * Map of headers which should be let through when the
          * anonymous feature is turned on.
          */
-        hashmap_t anonymous_map;
+        struct htab *anonymous_map;
 
         /*
          * Extra headers to be added to outgoing HTTP requests.
          */
-        vector_t add_headers;
+        sblist* add_headers;
 };
 
-extern int reload_config_file (const char *config_fname, struct config_s *conf,
-                               struct config_s *defaults);
+extern int reload_config_file (const char *config_fname, struct config_s *conf);
 
-int config_compile_regex (void);
+int config_init (void);
+void free_config (struct config_s *conf);
 
 #endif

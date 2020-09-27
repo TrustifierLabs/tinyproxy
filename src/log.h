@@ -77,16 +77,7 @@
  *		don't advocate this, but it could be useful at times.)
  */
 
-#ifdef HAVE_SYSLOG_H
-#  include <syslog.h>
-#else
-#  define LOG_CRIT    2
-#  define LOG_ERR     3
-#  define LOG_WARNING 4
-#  define LOG_NOTICE  5
-#  define LOG_INFO    6
-#  define LOG_DEBUG   7
-#endif
+#include <syslog.h>
 
 #define LOG_CONN      8         /* extra to log connections without the INFO stuff */
 
@@ -115,7 +106,6 @@ extern void close_log_file (void);
 
 extern void log_message (int level, const char *fmt, ...);
 extern void set_log_level (int level);
-extern void send_stored_logs (void);
 
 extern int setup_logging (void);
 extern void shutdown_logging (void);

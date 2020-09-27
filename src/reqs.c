@@ -32,7 +32,8 @@
 #include "buffer.h"
 #include "conns.h"
 #include "filter.h"
-#include "hashmap.h"
+#include "hsearch.h"
+#include "orderedmap.h"
 #include "heap.h"
 #include "html-error.h"
 #include "log.h"
@@ -42,12 +43,15 @@
 #include "stats.h"
 #include "text.h"
 #include "utils.h"
-#include "vector.h"
+#include "sblist.h"
 #include "reverse-proxy.h"
 #include "transparent-proxy.h"
 #include "upstream.h"
 #include "connect-ports.h"
 #include "conf.h"
+#include "basicauth.h"
+#include "loop.h"
+#include "mypoll.h"
 
 /*
  * Maximum length of a HTTP line
@@ -59,11 +63,13 @@
  * enabled.
  */
 #ifdef UPSTREAM_SUPPORT
-#  define UPSTREAM_CONFIGURED() (config.upstream_list != NULL)
-#  define UPSTREAM_HOST(host) upstream_get(host, config.upstream_list)
+#  define UPSTREAM_CONFIGURED() (config->upstream_list != NULL)
+#  define UPSTREAM_HOST(host) upstream_get(host, config->upstream_list)
+#  define UPSTREAM_IS_HTTP(conn) (conn->upstream_proxy != NULL && conn->upstream_proxy->type == PT_HTTP)
 #else
 #  define UPSTREAM_CONFIGURED() (0)
 #  define UPSTREAM_HOST(host) (NULL)
+#  define UPSTREAM_IS_HTTP(up) (0)
 #endif
 
 /*
@@ -267,6 +273,17 @@ establish_http_connection (struct conn_s *connptr, struct request_s *request)
                                       "Connection: close\r\n",
                                       request->method, request->path,
                                       request->host, portbuff);
+        } else if (connptr->upstream_proxy &&
+                   connptr->upstream_proxy->type == PT_HTTP &&
+                   connptr->upstream_proxy->ua.authstr) {
+                return write_message (connptr->server_fd,
+                                      "%s %s HTTP/1.0\r\n"
+                                      "Host: %s%s\r\n"
+                                      "Connection: close\r\n"
+                                      "Proxy-Authorization: Basic %s\r\n",
+                                      request->method, request->path,
+                                      request->host, portbuff,
+                                      connptr->upstream_proxy->ua.authstr);
         } else {
                 return write_message (connptr->server_fd,
                                       "%s %s HTTP/1.0\r\n"
@@ -300,7 +317,7 @@ static int send_ssl_response (struct conn_s *connptr)
  * build a new request line. Finally connect to the remote server.
  */
 static struct request_s *process_request (struct conn_s *connptr,
-                                          hashmap_t hashofheaders)
+                                          orderedmap hashofheaders)
 {
         char *url;
         struct request_s *request;
@@ -358,7 +375,7 @@ BAD_REQUEST_ERROR:
         }
 
 #ifdef REVERSE_SUPPORT
-        if (config.reversepath_list != NULL) {
+        if (config->reversepath_list != NULL) {
                 /*
                  * Rewrite the URL based on the reverse path.  After calling
                  * reverse_rewrite_url "url" can be freed since we either
@@ -372,7 +389,7 @@ BAD_REQUEST_ERROR:
                 if (reverse_url != NULL) {
                         safefree (url);
                         url = reverse_url;
-                } else if (config.reverseonly) {
+                } else if (config->reverseonly) {
                         log_message (LOG_ERR,
                                      "Bad request, no mapping for '%s' found",
                                      url);
@@ -405,7 +422,7 @@ BAD_REQUEST_ERROR:
 
                 /* Verify that the port in the CONNECT method is allowed */
                 if (!check_allowed_connect_ports (request->port,
-                                                  config.connect_ports))
+                                                  config->connect_ports))
                 {
                         indicate_http_error (connptr, 403, "Access violation",
                                              "detail",
@@ -422,7 +439,7 @@ BAD_REQUEST_ERROR:
         } else {
 #ifdef TRANSPARENT_PROXY
                 if (!do_transparent_proxy
-                    (connptr, hashofheaders, request, &config, &url)) {
+                    (connptr, hashofheaders, request, config, &url)) {
                         goto fail;
                 }
 #else
@@ -440,16 +457,16 @@ BAD_REQUEST_ERROR:
         /*
          * Filter restricted domains/urls
          */
-        if (config.filter) {
-                if (config.filter_url)
-                        ret = filter_url (url);
+        if (config->filter) {
+                if (config->filter_url)
+                        ret = filter_run (url);
                 else
-                        ret = filter_domain (request->host);
+                        ret = filter_run (request->host);
 
                 if (ret) {
                         update_stats (STAT_DENIED);
 
-                        if (config.filter_url)
+                        if (config->filter_url)
                                 log_message (LOG_NOTICE,
                                              "Proxying refused on filtered url \"%s\"",
                                              url);
@@ -471,7 +488,7 @@ BAD_REQUEST_ERROR:
         /*
          * Check to see if they're requesting the stat host
          */
-        if (config.stathost && strcmp (config.stathost, request->host) == 0) {
+        if (config->stathost && strcmp (config->stathost, request->host) == 0) {
                 log_message (LOG_NOTICE, "Request for the stathost.");
                 connptr->show_stats = TRUE;
                 goto fail;
@@ -581,7 +598,7 @@ static int add_xtinyproxy_header (struct conn_s *connptr)
  * can be retrieved and manipulated later.
  */
 static int
-add_header_to_connection (hashmap_t hashofheaders, char *header, size_t len)
+add_header_to_connection (orderedmap hashofheaders, char *header, size_t len)
 {
         char *sep;
 
@@ -590,7 +607,7 @@ add_header_to_connection (hashmap_t hashofheaders, char *header, size_t len)
 
         sep = strchr (header, ':');
         if (!sep)
-                return -1;
+                return 0; /* just skip invalid header, do not give error */
 
         /* Blank out colons, spaces, and tabs. */
         while (*sep == ':' || *sep == ' ' || *sep == '\t')
@@ -599,7 +616,7 @@ add_header_to_connection (hashmap_t hashofheaders, char *header, size_t len)
         /* Calculate the new length of just the data */
         len -= sep - header - 1;
 
-        return hashmap_insert (hashofheaders, header, sep, len);
+        return orderedmap_append (hashofheaders, header, sep);
 }
 
 /*
@@ -612,7 +629,7 @@ add_header_to_connection (hashmap_t hashofheaders, char *header, size_t len)
 /*
  * Read all the headers from the stream
  */
-static int get_all_headers (int fd, hashmap_t hashofheaders)
+static int get_all_headers (int fd, orderedmap hashofheaders)
 {
         char *line = NULL;
         char *header = NULL;
@@ -705,7 +722,7 @@ static int get_all_headers (int fd, hashmap_t hashofheaders)
  * Extract the headers to remove.  These headers were listed in the Connection
  * and Proxy-Connection headers.
  */
-static int remove_connection_headers (hashmap_t hashofheaders)
+static int remove_connection_headers (orderedmap hashofheaders)
 {
         static const char *headers[] = {
                 "connection",
@@ -719,11 +736,12 @@ static int remove_connection_headers (hashmap_t hashofheaders)
 
         for (i = 0; i != (sizeof (headers) / sizeof (char *)); ++i) {
                 /* Look for the connection header.  If it's not found, return. */
-                len =
-                    hashmap_entry_by_key (hashofheaders, headers[i],
-                                          (void **) &data);
-                if (len <= 0)
+                data = orderedmap_find(hashofheaders, headers[i]);
+
+                if (!data)
                         return 0;
+
+                len = strlen(data);
 
                 /*
                  * Go through the data line and replace any special characters
@@ -739,7 +757,7 @@ static int remove_connection_headers (hashmap_t hashofheaders)
                  */
                 ptr = data;
                 while (ptr < data + len) {
-                        hashmap_remove (hashofheaders, ptr);
+                        orderedmap_remove (hashofheaders, ptr);
 
                         /* Advance ptr to the next token */
                         ptr += strlen (ptr) + 1;
@@ -748,7 +766,7 @@ static int remove_connection_headers (hashmap_t hashofheaders)
                 }
 
                 /* Now remove the connection header it self. */
-                hashmap_remove (hashofheaders, headers[i]);
+                orderedmap_remove (hashofheaders, headers[i]);
         }
 
         return 0;
@@ -758,16 +776,14 @@ static int remove_connection_headers (hashmap_t hashofheaders)
  * If there is a Content-Length header, then return the value; otherwise, return
  * a negative number.
  */
-static long get_content_length (hashmap_t hashofheaders)
+static long get_content_length (orderedmap hashofheaders)
 {
-        ssize_t len;
         char *data;
         long content_length = -1;
 
-        len =
-            hashmap_entry_by_key (hashofheaders, "content-length",
-                                  (void **) &data);
-        if (len > 0)
+        data = orderedmap_find (hashofheaders, "content-length");
+
+        if (data)
                 content_length = atol (data);
 
         return content_length;
@@ -781,21 +797,20 @@ static long get_content_length (hashmap_t hashofheaders)
  * purposes.
  */
 static int
-write_via_header (int fd, hashmap_t hashofheaders,
+write_via_header (int fd, orderedmap hashofheaders,
                   unsigned int major, unsigned int minor)
 {
-        ssize_t len;
         char hostname[512];
         char *data;
         int ret;
 
-        if (config.disable_viaheader) {
+        if (config->disable_viaheader) {
                 ret = 0;
                 goto done;
         }
 
-        if (config.via_proxy_name) {
-                strlcpy (hostname, config.via_proxy_name, sizeof (hostname));
+        if (config->via_proxy_name) {
+                strlcpy (hostname, config->via_proxy_name, sizeof (hostname));
         } else if (gethostname (hostname, sizeof (hostname)) < 0) {
                 strlcpy (hostname, "unknown", 512);
         }
@@ -804,14 +819,14 @@ write_via_header (int fd, hashmap_t hashofheaders,
          * See if there is a "Via" header.  If so, again we need to do a bit
          * of processing.
          */
-        len = hashmap_entry_by_key (hashofheaders, "via", (void **) &data);
-        if (len > 0) {
+        data = orderedmap_find (hashofheaders, "via");
+        if (data) {
                 ret = write_message (fd,
                                      "Via: %s, %hu.%hu %s (%s/%s)\r\n",
                                      data, major, minor, hostname, PACKAGE,
                                      VERSION);
 
-                hashmap_remove (hashofheaders, "via");
+                orderedmap_remove (hashofheaders, "via");
         } else {
                 ret = write_message (fd,
                                      "Via: %hu.%hu %s (%s/%s)\r\n",
@@ -825,7 +840,7 @@ done:
 /*
  * Number of buckets to use internally in the hashmap.
  */
-#define HEADER_BUCKETS 256
+#define HEADER_BUCKETS 32
 
 /*
  * Here we loop through all the headers the client is sending. If we
@@ -834,7 +849,7 @@ done:
  *	- rjkaes
  */
 static int
-process_client_headers (struct conn_s *connptr, hashmap_t hashofheaders)
+process_client_headers (struct conn_s *connptr, orderedmap hashofheaders)
 {
         static const char *skipheaders[] = {
                 "host",
@@ -845,7 +860,7 @@ process_client_headers (struct conn_s *connptr, hashmap_t hashofheaders)
                 "upgrade"
         };
         int i;
-        hashmap_iter iter;
+        size_t iter;
         int ret = 0;
 
         char *data, *header;
@@ -853,10 +868,10 @@ process_client_headers (struct conn_s *connptr, hashmap_t hashofheaders)
         /*
          * Don't send headers if there's already an error, if the request was
          * a stats request, or if this was a CONNECT method (unless upstream
-         * proxy is in use.)
+         * http proxy is in use.)
          */
         if (connptr->server_fd == -1 || connptr->show_stats
-            || (connptr->connect_method && (connptr->upstream_proxy == NULL))) {
+            || (connptr->connect_method && ! UPSTREAM_IS_HTTP(connptr))) {
                 log_message (LOG_INFO,
                              "Not sending client headers to remote machine");
                 return 0;
@@ -878,7 +893,7 @@ process_client_headers (struct conn_s *connptr, hashmap_t hashofheaders)
          * Delete the headers listed in the skipheaders list
          */
         for (i = 0; i != (sizeof (skipheaders) / sizeof (char *)); i++) {
-                hashmap_remove (hashofheaders, skipheaders[i]);
+                orderedmap_remove (hashofheaders, skipheaders[i]);
         }
 
         /* Send, or add the Via header */
@@ -898,32 +913,27 @@ process_client_headers (struct conn_s *connptr, hashmap_t hashofheaders)
         /*
          * Output all the remaining headers to the remote machine.
          */
-        iter = hashmap_first (hashofheaders);
-        if (iter >= 0) {
-                for (; !hashmap_is_end (hashofheaders, iter); ++iter) {
-                        hashmap_return_entry (hashofheaders,
-                                              iter, &data, (void **) &header);
-
-                        if (!is_anonymous_enabled ()
-                            || anonymous_search (data) > 0) {
-                                ret =
-                                    write_message (connptr->server_fd,
-                                                   "%s: %s\r\n", data, header);
-                                if (ret < 0) {
-                                        indicate_http_error (connptr, 503,
-                                                             "Could not send data to remote server",
-                                                             "detail",
-                                                             "A network error occurred while "
-                                                             "trying to write data to the "
-                                                             "remote web server.",
-                                                             NULL);
-                                        goto PULL_CLIENT_DATA;
-                                }
+        iter = 0;
+        while((iter = orderedmap_next(hashofheaders, iter, &data, &header))) {
+                if (!is_anonymous_enabled (config)
+                    || anonymous_search (config, data) > 0) {
+                        ret =
+                            write_message (connptr->server_fd,
+                                           "%s: %s\r\n", data, header);
+                        if (ret < 0) {
+                                indicate_http_error (connptr, 503,
+                                                     "Could not send data to remote server",
+                                                     "detail",
+                                                     "A network error occurred while "
+                                                     "trying to write data to the "
+                                                     "remote web server.",
+                                                     NULL);
+                                goto PULL_CLIENT_DATA;
                         }
                 }
         }
 #if defined(XTINYPROXY_ENABLE)
-        if (config.add_xtinyproxy)
+        if (config->add_xtinyproxy)
                 add_xtinyproxy_header (connptr);
 #endif
 
@@ -958,15 +968,15 @@ static int process_server_headers (struct conn_s *connptr)
 
         char *response_line;
 
-        hashmap_t hashofheaders;
-        hashmap_iter iter;
+        orderedmap hashofheaders;
+        size_t iter;
         char *data, *header;
         ssize_t len;
         int i;
         int ret;
 
 #ifdef REVERSE_SUPPORT
-        struct reversepath *reverse = config.reversepath_list;
+        struct reversepath *reverse = config->reversepath_list;
 #endif
 
         /* Get the response line from the remote server. */
@@ -988,7 +998,7 @@ retry:
                 goto retry;
         }
 
-        hashofheaders = hashmap_create (HEADER_BUCKETS);
+        hashofheaders = orderedmap_create (HEADER_BUCKETS);
         if (!hashofheaders) {
                 safefree (response_line);
                 return -1;
@@ -1000,7 +1010,7 @@ retry:
         if (get_all_headers (connptr->server_fd, hashofheaders) < 0) {
                 log_message (LOG_WARNING,
                              "Could not retrieve all the headers from the remote server.");
-                hashmap_delete (hashofheaders);
+                orderedmap_destroy (hashofheaders);
                 safefree (response_line);
 
                 indicate_http_error (connptr, 503,
@@ -1019,7 +1029,7 @@ retry:
          * Instead we'll free all the memory and return.
          */
         if (connptr->protocol.major < 1) {
-                hashmap_delete (hashofheaders);
+                orderedmap_destroy (hashofheaders);
                 safefree (response_line);
                 return 0;
         }
@@ -1046,7 +1056,7 @@ retry:
          * Delete the headers listed in the skipheaders list
          */
         for (i = 0; i != (sizeof (skipheaders) / sizeof (char *)); i++) {
-                hashmap_remove (hashofheaders, skipheaders[i]);
+                orderedmap_remove (hashofheaders, skipheaders[i]);
         }
 
         /* Send, or add the Via header */
@@ -1058,7 +1068,7 @@ retry:
 
 #ifdef REVERSE_SUPPORT
         /* Write tracking cookie for the magical reverse proxy path hack */
-        if (config.reversemagic && connptr->reversepath) {
+        if (config->reversemagic && connptr->reversepath) {
                 ret = write_message (connptr->client_fd,
                                      "Set-Cookie: " REVERSE_COOKIE
                                      "=%s; path=/\r\n", connptr->reversepath);
@@ -1067,9 +1077,8 @@ retry:
         }
 
         /* Rewrite the HTTP redirect if needed */
-        if (config.reversebaseurl &&
-            hashmap_entry_by_key (hashofheaders, "location",
-                                  (void **) &header) > 0) {
+        if (config->reversebaseurl &&
+            (header = orderedmap_find (hashofheaders, "location"))) {
 
                 /* Look for a matching entry in the reversepath list */
                 while (reverse) {
@@ -1085,16 +1094,16 @@ retry:
                         ret =
                             write_message (connptr->client_fd,
                                            "Location: %s%s%s\r\n",
-                                           config.reversebaseurl,
+                                           config->reversebaseurl,
                                            (reverse->path + 1), (header + len));
                         if (ret < 0)
                                 goto ERROR_EXIT;
 
                         log_message (LOG_INFO,
                                      "Rewriting HTTP redirect: %s -> %s%s%s",
-                                     header, config.reversebaseurl,
+                                     header, config->reversebaseurl,
                                      (reverse->path + 1), (header + len));
-                        hashmap_remove (hashofheaders, "location");
+                        orderedmap_remove (hashofheaders, "location");
                 }
         }
 #endif
@@ -1102,19 +1111,15 @@ retry:
         /*
          * All right, output all the remaining headers to the client.
          */
-        iter = hashmap_first (hashofheaders);
-        if (iter >= 0) {
-                for (; !hashmap_is_end (hashofheaders, iter); ++iter) {
-                        hashmap_return_entry (hashofheaders,
-                                              iter, &data, (void **) &header);
+        iter = 0;
+        while ((iter = orderedmap_next(hashofheaders, iter, &data, &header))) {
 
-                        ret = write_message (connptr->client_fd,
-                                             "%s: %s\r\n", data, header);
-                        if (ret < 0)
-                                goto ERROR_EXIT;
-                }
+                ret = write_message (connptr->client_fd,
+                                     "%s: %s\r\n", data, header);
+                if (ret < 0)
+                        goto ERROR_EXIT;
         }
-        hashmap_delete (hashofheaders);
+        orderedmap_destroy (hashofheaders);
 
         /* Write the final blank line to signify the end of the headers */
         if (safe_write (connptr->client_fd, "\r\n", 2) < 0)
@@ -1123,7 +1128,7 @@ retry:
         return 0;
 
 ERROR_EXIT:
-        hashmap_delete (hashofheaders);
+        orderedmap_destroy (hashofheaders);
         return -1;
 }
 
@@ -1137,74 +1142,39 @@ ERROR_EXIT:
  */
 static void relay_connection (struct conn_s *connptr)
 {
-        fd_set rset, wset;
-        struct timeval tv;
-        time_t last_access;
         int ret;
-        double tdiff;
-        int maxfd = max (connptr->client_fd, connptr->server_fd) + 1;
         ssize_t bytes_received;
 
-        ret = socket_nonblocking (connptr->client_fd);
-        if (ret != 0) {
-                log_message(LOG_ERR, "Failed to set the client socket "
-                            "to non-blocking: %s", strerror(errno));
-                return;
-        }
-
-        ret = socket_nonblocking (connptr->server_fd);
-        if (ret != 0) {
-                log_message(LOG_ERR, "Failed to set the server socket "
-                            "to non-blocking: %s", strerror(errno));
-                return;
-        }
-
-        last_access = time (NULL);
-
         for (;;) {
-                FD_ZERO (&rset);
-                FD_ZERO (&wset);
-
-                tv.tv_sec =
-                    config.idletimeout - difftime (time (NULL), last_access);
-                tv.tv_usec = 0;
+                pollfd_struct fds[2] = {0};
+                fds[0].fd = connptr->client_fd;
+                fds[1].fd = connptr->server_fd;
 
                 if (buffer_size (connptr->sbuffer) > 0)
-                        FD_SET (connptr->client_fd, &wset);
+                        fds[0].events |= MYPOLL_WRITE;
                 if (buffer_size (connptr->cbuffer) > 0)
-                        FD_SET (connptr->server_fd, &wset);
+                        fds[1].events |= MYPOLL_WRITE;
                 if (buffer_size (connptr->sbuffer) < MAXBUFFSIZE)
-                        FD_SET (connptr->server_fd, &rset);
+                        fds[1].events |= MYPOLL_READ;
                 if (buffer_size (connptr->cbuffer) < MAXBUFFSIZE)
-                        FD_SET (connptr->client_fd, &rset);
+                        fds[0].events |= MYPOLL_READ;
 
-                ret = select (maxfd, &rset, &wset, NULL, &tv);
+                ret = mypoll(fds, 2, config->idletimeout);
 
                 if (ret == 0) {
-                        tdiff = difftime (time (NULL), last_access);
-                        if (tdiff > config.idletimeout) {
-                                log_message (LOG_INFO,
-                                             "Idle Timeout (after select) as %g > %u.",
-                                             tdiff, config.idletimeout);
+                        log_message (LOG_INFO,
+                                     "Idle Timeout (after " SELECT_OR_POLL ")");
                                 return;
-                        } else {
-                                continue;
-                        }
                 } else if (ret < 0) {
                         log_message (LOG_ERR,
-                                     "relay_connection: select() error \"%s\". "
+                                     "relay_connection: " SELECT_OR_POLL "() error \"%s\". "
                                      "Closing connection (client_fd:%d, server_fd:%d)",
                                      strerror (errno), connptr->client_fd,
                                      connptr->server_fd);
                         return;
-                } else {
-                        /*
-                         * All right, something was actually selected so mark it.
-                         */
-                        last_access = time (NULL);
                 }
 
-                if (FD_ISSET (connptr->server_fd, &rset)) {
+                if (fds[1].revents & MYPOLL_READ) {
                         bytes_received =
                             read_buffer (connptr->server_fd, connptr->sbuffer);
                         if (bytes_received < 0)
@@ -1214,30 +1184,18 @@ static void relay_connection (struct conn_s *connptr)
                         if (connptr->content_length.server == 0)
                                 break;
                 }
-                if (FD_ISSET (connptr->client_fd, &rset)
+                if ((fds[0].revents & MYPOLL_READ)
                     && read_buffer (connptr->client_fd, connptr->cbuffer) < 0) {
                         break;
                 }
-                if (FD_ISSET (connptr->server_fd, &wset)
+                if ((fds[1].revents & MYPOLL_WRITE)
                     && write_buffer (connptr->server_fd, connptr->cbuffer) < 0) {
                         break;
                 }
-                if (FD_ISSET (connptr->client_fd, &wset)
+                if ((fds[0].revents & MYPOLL_WRITE)
                     && write_buffer (connptr->client_fd, connptr->sbuffer) < 0) {
                         break;
                 }
-        }
-
-        /*
-         * Here the server has closed the connection... write the
-         * remainder to the client and then exit.
-         */
-        ret = socket_blocking (connptr->client_fd);
-        if (ret != 0) {
-                log_message(LOG_ERR,
-                            "Failed to set client socket to blocking: %s",
-                            strerror(errno));
-                return;
         }
 
         while (buffer_size (connptr->sbuffer) > 0) {
@@ -1264,6 +1222,122 @@ static void relay_connection (struct conn_s *connptr)
 
         return;
 }
+
+static int
+connect_to_upstream_proxy(struct conn_s *connptr, struct request_s *request)
+{
+	unsigned len;
+	unsigned char buff[512]; /* won't use more than 7 + 255 */
+	unsigned short port;
+	size_t ulen, passlen;
+
+	struct hostent *host;
+	struct upstream *cur_upstream = connptr->upstream_proxy;
+
+	ulen = cur_upstream->ua.user ? strlen(cur_upstream->ua.user) : 0;
+	passlen = cur_upstream->pass ? strlen(cur_upstream->pass) : 0;
+
+
+	log_message(LOG_CONN,
+		    "Established connection to %s proxy \"%s\" using file descriptor %d.",
+		    proxy_type_name(cur_upstream->type), cur_upstream->host, connptr->server_fd);
+
+	if (cur_upstream->type == PT_SOCKS4) {
+
+		buff[0] = 4; /* socks version */
+		buff[1] = 1; /* connect command */
+		port = htons(request->port);
+		memcpy(&buff[2], &port, 2); /* dest port */
+		host = gethostbyname(request->host);
+		memcpy(&buff[4], host->h_addr_list[0], 4); /* dest ip */
+		buff[8] = 0; /* user */
+		if (9 != safe_write(connptr->server_fd, buff, 9))
+			return -1;
+		if (8 != safe_read(connptr->server_fd, buff, 8))
+			return -1;
+		if (buff[0]!=0 || buff[1]!=90)
+			return -1;
+
+	} else if (cur_upstream->type == PT_SOCKS5) {
+
+		/* init */
+		int n_methods = ulen ? 2 : 1;
+		buff[0] = 5; /* socks version */
+		buff[1] = n_methods; /* number of methods  */
+		buff[2] = 0; /* no auth method */
+		if (ulen) buff[3] = 2;  /* auth method -> username / password */
+		if (2+n_methods != safe_write(connptr->server_fd, buff, 2+n_methods))
+			return -1;
+		if (2 != safe_read(connptr->server_fd, buff, 2))
+			return -1;
+		if (buff[0] != 5 || (buff[1] != 0 && buff[1] != 2))
+			return -1;
+
+		if (buff[1] == 2) {
+			/* authentication */
+			char in[2];
+			char out[515];
+			char *cur = out;
+			size_t c;
+			*cur++ = 1;	/* version */
+			c = ulen & 0xFF;
+			*cur++ = c;
+			memcpy(cur, cur_upstream->ua.user, c);
+			cur += c;
+			c = passlen & 0xFF;
+			*cur++ = c;
+			memcpy(cur, cur_upstream->pass, c);
+			cur += c;
+
+			if((cur - out) != safe_write(connptr->server_fd, out, cur - out))
+				return -1;
+
+			if(2 != safe_read(connptr->server_fd, in, 2))
+				return -1;
+			if(in[1] != 0 || !(in[0] == 5 || in[0] == 1)) {
+				return -1;
+			}
+		}
+		/* connect */
+		buff[0] = 5; /* socks version */
+		buff[1] = 1; /* connect */
+		buff[2] = 0; /* reserved */
+		buff[3] = 3; /* domainname */
+		len=strlen(request->host);
+		if(len>255)
+			return -1;
+		buff[4] = len; /* length of domainname */
+		memcpy(&buff[5], request->host, len); /* dest ip */
+		port = htons(request->port);
+		memcpy(&buff[5+len], &port, 2); /* dest port */
+		if (7+len != safe_write(connptr->server_fd, buff, 7+len))
+			return -1;
+		if (4 != safe_read(connptr->server_fd, buff, 4))
+			return -1;
+		if (buff[0]!=5 || buff[1]!=0)
+			return -1;
+		switch(buff[3]) {
+			case 1: len=4; break; /* ip v4 */
+			case 4: len=16; break; /* ip v6 */
+			case 3: /* domainname */
+				if (1 != safe_read(connptr->server_fd, buff, 1))
+					return -1;
+				len = buff[0]; /* max = 255 */
+				break;
+			default: return -1;
+		}
+		if (2+len != safe_read(connptr->server_fd, buff, 2+len))
+			return -1;
+	} else {
+		return -1;
+	}
+
+	if (connptr->connect_method)
+		return 0;
+
+	return establish_http_connection(connptr, request);
+}
+
 
 /*
  * Establish a connection to the upstream proxy server.
@@ -1308,6 +1382,9 @@ connect_to_upstream (struct conn_s *connptr, struct request_s *request)
                 return -1;
         }
 
+	if (cur_upstream->type != PT_HTTP)
+		return connect_to_upstream_proxy(connptr, request);
+
         log_message (LOG_CONN,
                      "Established connection to upstream proxy \"%s\" "
                      "using file descriptor %d.",
@@ -1347,26 +1424,27 @@ connect_to_upstream (struct conn_s *connptr, struct request_s *request)
 #endif
 }
 
+/* this function "drains" remaining bytes in the read pipe from
+   the client. it's usually only called on error before displaying
+   an error code/page. */
 static int
 get_request_entity(struct conn_s *connptr)
 {
         int ret;
-        fd_set rset;
-        struct timeval tv;
+        pollfd_struct fds[1] = {0};
 
-        FD_ZERO (&rset);
-        FD_SET (connptr->client_fd, &rset);
-        tv.tv_sec = 0;
-        tv.tv_usec = 0;
-        ret = select (connptr->client_fd + 1, &rset, NULL, NULL, &tv);
+        fds[0].fd = connptr->client_fd;
+        fds[0].events |= MYPOLL_READ;
+
+        ret = mypoll(fds, 1, config->idletimeout);
 
         if (ret == -1) {
                 log_message (LOG_ERR,
-                             "Error calling select on client fd %d: %s",
+                             "Error calling " SELECT_OR_POLL " on client fd %d: %s",
                              connptr->client_fd, strerror(errno));
         } else if (ret == 0) {
                log_message (LOG_INFO, "no entity");
-        } else if (ret == 1 && FD_ISSET (connptr->client_fd, &rset)) {
+        } else if (ret == 1 && (fds[0].revents & MYPOLL_READ)) {
                 ssize_t nread;
                 nread = read_buffer (connptr->client_fd, connptr->cbuffer);
                 if (nread < 0) {
@@ -1381,7 +1459,7 @@ get_request_entity(struct conn_s *connptr)
                         ret = 0;
                 }
         } else {
-                log_message (LOG_ERR, "strange situation after select: "
+                log_message (LOG_ERR, "strange situation after " SELECT_OR_POLL ": "
                              "ret = %d, but client_fd (%d) is not readable...",
                              ret, connptr->client_fd);
                 ret = -1;
@@ -1390,175 +1468,15 @@ get_request_entity(struct conn_s *connptr)
         return ret;
 }
 
-
-/*
- * This is the main drive for each connection. As you can tell, for the
- * first few steps we are using a blocking socket. If you remember the
- * older tinyproxy code, this use to be a very confusing state machine.
- * Well, no more! :) The sockets are only switched into nonblocking mode
- * when we start the relay portion. This makes most of the original
- * tinyproxy code, which was confusing, redundant. Hail progress.
- * 	- rjkaes
- */
-void handle_connection (int fd)
+static void handle_connection_failure(struct conn_s *connptr, int got_headers)
 {
-        ssize_t i;
-        struct conn_s *connptr;
-        struct request_s *request = NULL;
-        hashmap_t hashofheaders = NULL;
-
-        char sock_ipaddr[IP_LENGTH];
-        char peer_ipaddr[IP_LENGTH];
-        char peer_string[HOSTNAME_LENGTH];
-
-        getpeer_information (fd, peer_ipaddr, peer_string);
-
-        if (config.bindsame)
-                getsock_ip (fd, sock_ipaddr);
-
-        log_message (LOG_CONN, config.bindsame ?
-                     "Connect (file descriptor %d): %s [%s] at [%s]" :
-                     "Connect (file descriptor %d): %s [%s]",
-                     fd, peer_string, peer_ipaddr, sock_ipaddr);
-
-        connptr = initialize_conn (fd, peer_ipaddr, peer_string,
-                                   config.bindsame ? sock_ipaddr : NULL);
-        if (!connptr) {
-                close (fd);
-                return;
-        }
-
-        if (check_acl (peer_ipaddr, peer_string, config.access_list) <= 0) {
-                update_stats (STAT_DENIED);
-                indicate_http_error (connptr, 403, "Access denied",
-                                     "detail",
-                                     "The administrator of this proxy has not configured "
-                                     "it to service requests from your host.",
-                                     NULL);
-                goto fail;
-        }
-
-        if (read_request_line (connptr) < 0) {
-                update_stats (STAT_BADCONN);
-                indicate_http_error (connptr, 408, "Timeout",
-                                     "detail",
-                                     "Server timeout waiting for the HTTP request "
-                                     "from the client.", NULL);
-                goto fail;
-        }
-
-        /*
-         * The "hashofheaders" store the client's headers.
-         */
-        hashofheaders = hashmap_create (HEADER_BUCKETS);
-        if (hashofheaders == NULL) {
-                update_stats (STAT_BADCONN);
-                indicate_http_error (connptr, 503, "Internal error",
-                                     "detail",
-                                     "An internal server error occurred while processing "
-                                     "your request. Please contact the administrator.",
-                                     NULL);
-                goto fail;
-        }
-
-        /*
-         * Get all the headers from the client in a big hash.
-         */
-        if (get_all_headers (connptr->client_fd, hashofheaders) < 0) {
-                log_message (LOG_WARNING,
-                             "Could not retrieve all the headers from the client");
-                indicate_http_error (connptr, 400, "Bad Request",
-                                     "detail",
-                                     "Could not retrieve all the headers from "
-                                     "the client.", NULL);
-                update_stats (STAT_BADCONN);
-                goto fail;
-        }
-
-        /*
-         * Add any user-specified headers (AddHeader directive) to the
-         * outgoing HTTP request.
-         */
-        for (i = 0; i < vector_length (config.add_headers); i++) {
-                http_header_t *header = (http_header_t *)
-                        vector_getentry (config.add_headers, i, NULL);
-
-                hashmap_insert (hashofheaders,
-                                header->name,
-                                header->value, strlen (header->value) + 1);
-        }
-
-        request = process_request (connptr, hashofheaders);
-        if (!request) {
-                if (!connptr->show_stats) {
-                        update_stats (STAT_BADCONN);
-                }
-                goto fail;
-        }
-
-        connptr->upstream_proxy = UPSTREAM_HOST (request->host);
-        if (connptr->upstream_proxy != NULL) {
-                if (connect_to_upstream (connptr, request) < 0) {
-                        goto fail;
-                }
-        } else {
-                connptr->server_fd = opensock (request->host, request->port,
-                                               connptr->server_ip_addr);
-                if (connptr->server_fd < 0) {
-                        indicate_http_error (connptr, 500, "Unable to connect",
-                                             "detail",
-                                             PACKAGE_NAME " "
-                                             "was unable to connect to the remote web server.",
-                                             "error", strerror (errno), NULL);
-                        goto fail;
-                }
-
-                log_message (LOG_CONN,
-                             "Established connection to host \"%s\" using "
-                             "file descriptor %d.", request->host,
-                             connptr->server_fd);
-
-                if (!connptr->connect_method)
-                        establish_http_connection (connptr, request);
-        }
-
-        if (process_client_headers (connptr, hashofheaders) < 0) {
-                update_stats (STAT_BADCONN);
-                goto fail;
-        }
-
-        if (!(connptr->connect_method && (connptr->upstream_proxy == NULL))) {
-                if (process_server_headers (connptr) < 0) {
-                        update_stats (STAT_BADCONN);
-                        goto fail;
-                }
-        } else {
-                if (send_ssl_response (connptr) < 0) {
-                        log_message (LOG_ERR,
-                                     "handle_connection: Could not send SSL greeting "
-                                     "to client.");
-                        update_stats (STAT_BADCONN);
-                        goto fail;
-                }
-        }
-
-        relay_connection (connptr);
-
-        log_message (LOG_INFO,
-                     "Closed connection between local client (fd:%d) "
-                     "and remote client (fd:%d)",
-                     connptr->client_fd, connptr->server_fd);
-
-        goto done;
-
-fail:
         /*
          * First, get the body if there is one.
          * If we don't read all there is from the socket first,
          * it is still marked for reading and we won't be able
          * to send our data properly.
          */
-        if (get_request_entity (connptr) < 0) {
+        if (!got_headers && get_request_entity (connptr) < 0) {
                 log_message (LOG_WARNING,
                              "Could not retrieve request entity");
                 indicate_http_error (connptr, 400, "Bad Request",
@@ -1573,10 +1491,247 @@ fail:
         } else if (connptr->show_stats) {
                 showstats (connptr);
         }
+}
+
+
+/*
+ * This is the main drive for each connection. As you can tell, for the
+ * first few steps we are using a blocking socket. If you remember the
+ * older tinyproxy code, this use to be a very confusing state machine.
+ * Well, no more! :) The sockets are only switched into nonblocking mode
+ * when we start the relay portion. This makes most of the original
+ * tinyproxy code, which was confusing, redundant. Hail progress.
+ * 	- rjkaes
+ */
+void handle_connection (struct conn_s *connptr, union sockaddr_union* addr)
+{
+
+#define HC_FAIL() \
+        do {handle_connection_failure(connptr, got_headers); goto done;} \
+        while(0)
+
+        int got_headers = 0, fd = connptr->client_fd;
+        size_t i;
+        struct request_s *request = NULL;
+        struct timeval tv;
+        orderedmap hashofheaders = NULL;
+
+        char sock_ipaddr[IP_LENGTH];
+        char peer_ipaddr[IP_LENGTH];
+
+        getpeer_information (addr, peer_ipaddr, sizeof(peer_ipaddr));
+
+        if (config->bindsame)
+                getsock_ip (fd, sock_ipaddr);
+
+        log_message (LOG_CONN, config->bindsame ?
+                     "Connect (file descriptor %d): %s at [%s]" :
+                     "Connect (file descriptor %d): %s",
+                     fd, peer_ipaddr, sock_ipaddr);
+
+        if(!conn_init_contents (connptr, peer_ipaddr,
+                                   config->bindsame ? sock_ipaddr : NULL)) {
+                close (fd);
+                return;
+        }
+
+        tv.tv_usec = 0;
+        tv.tv_sec = config->idletimeout;
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, (void*) &tv, sizeof(tv));
+        tv.tv_usec = 0;
+        tv.tv_sec = config->idletimeout;
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (void*) &tv, sizeof(tv));
+
+        if (connection_loops (addr))  {
+                log_message (LOG_CONN,
+                             "Prevented endless loop (file descriptor %d): %s",
+                             fd, peer_ipaddr);
+
+                indicate_http_error(connptr, 400, "Bad Request",
+                                    "detail",
+                                    "You tried to connect to the "
+                                    "machine the proxy is running on",
+                                    NULL);
+                HC_FAIL();
+        }
+
+
+        if (check_acl (peer_ipaddr, addr, config->access_list) <= 0) {
+                update_stats (STAT_DENIED);
+                indicate_http_error (connptr, 403, "Access denied",
+                                     "detail",
+                                     "The administrator of this proxy has not configured "
+                                     "it to service requests from your host.",
+                                     NULL);
+                HC_FAIL();
+        }
+
+        if (read_request_line (connptr) < 0) {
+                update_stats (STAT_BADCONN);
+                indicate_http_error (connptr, 408, "Timeout",
+                                     "detail",
+                                     "Server timeout waiting for the HTTP request "
+                                     "from the client.", NULL);
+                HC_FAIL();
+        }
+
+        /*
+         * The "hashofheaders" store the client's headers.
+         */
+        hashofheaders = orderedmap_create (HEADER_BUCKETS);
+        if (hashofheaders == NULL) {
+                update_stats (STAT_BADCONN);
+                indicate_http_error (connptr, 503, "Internal error",
+                                     "detail",
+                                     "An internal server error occurred while processing "
+                                     "your request. Please contact the administrator.",
+                                     NULL);
+                HC_FAIL();
+        }
+
+        /*
+         * Get all the headers from the client in a big hash.
+         */
+        if (get_all_headers (connptr->client_fd, hashofheaders) < 0) {
+                log_message (LOG_WARNING,
+                             "Could not retrieve all the headers from the client");
+                indicate_http_error (connptr, 400, "Bad Request",
+                                     "detail",
+                                     "Could not retrieve all the headers from "
+                                     "the client.", NULL);
+                update_stats (STAT_BADCONN);
+                HC_FAIL();
+        }
+        got_headers = 1;
+
+        if (config->basicauth_list != NULL) {
+                char *authstring;
+                int failure = 1, stathost_connect = 0;
+                authstring = orderedmap_find (hashofheaders, "proxy-authorization");
+
+                if (!authstring && config->stathost) {
+                        authstring = orderedmap_find (hashofheaders, "host");
+                        if (authstring && !strncmp(authstring, config->stathost, strlen(config->stathost))) {
+                                authstring = orderedmap_find (hashofheaders, "authorization");
+                                stathost_connect = 1;
+                        } else authstring = 0;
+                }
+
+                if (!authstring) {
+                        if (stathost_connect) goto e401;
+                        update_stats (STAT_DENIED);
+                        indicate_http_error (connptr, 407, "Proxy Authentication Required",
+                                             "detail",
+                                             "This proxy requires authentication.",
+                                             NULL);
+                        HC_FAIL();
+                }
+                if ( /* currently only "basic" auth supported */
+                        (strncmp(authstring, "Basic ", 6) == 0 ||
+                         strncmp(authstring, "basic ", 6) == 0) &&
+                        basicauth_check (config->basicauth_list, authstring + 6) == 1)
+                                failure = 0;
+                if(failure) {
+e401:
+                        update_stats (STAT_DENIED);
+                        indicate_http_error (connptr, 401, "Unauthorized",
+                                             "detail",
+                                             "The administrator of this proxy has not configured "
+                                             "it to service requests from you.",
+                                             NULL);
+                        HC_FAIL();
+                }
+                orderedmap_remove (hashofheaders, "proxy-authorization");
+        }
+
+        /*
+         * Add any user-specified headers (AddHeader directive) to the
+         * outgoing HTTP request.
+         */
+        if (config->add_headers)
+        for (i = 0; i < sblist_getsize (config->add_headers); i++) {
+                http_header_t *header = sblist_get (config->add_headers, i);
+
+                orderedmap_append (hashofheaders, header->name, header->value);
+        }
+
+        request = process_request (connptr, hashofheaders);
+        if (!request) {
+                if (!connptr->show_stats) {
+                        update_stats (STAT_BADCONN);
+                }
+                HC_FAIL();
+        }
+
+        connptr->upstream_proxy = UPSTREAM_HOST (request->host);
+        if (connptr->upstream_proxy != NULL) {
+                if (connect_to_upstream (connptr, request) < 0) {
+                        HC_FAIL();
+                }
+        } else {
+                connptr->server_fd = opensock (request->host, request->port,
+                                               connptr->server_ip_addr);
+                if (connptr->server_fd < 0) {
+                        indicate_http_error (connptr, 500, "Unable to connect",
+                                             "detail",
+                                             PACKAGE_NAME " "
+                                             "was unable to connect to the remote web server.",
+                                             "error", strerror (errno), NULL);
+                        HC_FAIL();
+                }
+
+                log_message (LOG_CONN,
+                             "Established connection to host \"%s\" using "
+                             "file descriptor %d.", request->host,
+                             connptr->server_fd);
+
+                if (!connptr->connect_method)
+                        establish_http_connection (connptr, request);
+        }
+
+        if (process_client_headers (connptr, hashofheaders) < 0) {
+                update_stats (STAT_BADCONN);
+                log_message (LOG_INFO,
+                             "process_client_headers failed: %s. host \"%s\" using "
+                             "file descriptor %d.", strerror(errno),
+                             request->host,
+                             connptr->server_fd);
+
+                HC_FAIL();
+        }
+
+        if (!connptr->connect_method || UPSTREAM_IS_HTTP(connptr)) {
+                if (process_server_headers (connptr) < 0) {
+                        update_stats (STAT_BADCONN);
+                        log_message (LOG_INFO,
+                             "process_server_headers failed: %s. host \"%s\" using "
+                             "file descriptor %d.", strerror(errno),
+                             request->host,
+                             connptr->server_fd);
+
+                        HC_FAIL();
+                }
+        } else {
+                if (send_ssl_response (connptr) < 0) {
+                        log_message (LOG_ERR,
+                                     "handle_connection: Could not send SSL greeting "
+                                     "to client.");
+                        update_stats (STAT_BADCONN);
+                        HC_FAIL();
+                }
+        }
+
+        relay_connection (connptr);
+
+        log_message (LOG_INFO,
+                     "Closed connection between local client (fd:%d) "
+                     "and remote client (fd:%d)",
+                     connptr->client_fd, connptr->server_fd);
 
 done:
         free_request_struct (request);
-        hashmap_delete (hashofheaders);
-        destroy_conn (connptr);
+        orderedmap_destroy (hashofheaders);
+        conn_destroy_contents (connptr);
         return;
+#undef HC_FAIL
 }

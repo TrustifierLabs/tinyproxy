@@ -17,7 +17,7 @@
 
 pkgsysconfdir = $(sysconfdir)/$(PACKAGE)
 
-sbin_PROGRAMS = tinyproxy
+bin_PROGRAMS = tinyproxy
 
 AM_CPPFLAGS = \
 	-DSYSCONFDIR=\"${pkgsysconfdir}\" \
@@ -26,14 +26,13 @@ AM_CPPFLAGS = \
 tinyproxy_SOURCES = \
 	acl.c acl.h \
 	anonymous.c anonymous.h \
-	authors.c authors.h \
 	buffer.c buffer.h \
 	child.c child.h \
 	common.h \
+	conf-tokens.c conf-tokens.h \
 	conf.c conf.h \
 	conns.c conns.h \
 	daemon.c daemon.h \
-	hashmap.c hashmap.h \
 	heap.c heap.h \
 	html-error.c html-error.h \
 	http-message.c http-message.h \
@@ -45,25 +44,24 @@ tinyproxy_SOURCES = \
 	text.c text.h \
 	main.c main.h \
 	utils.c utils.h \
-	vector.c vector.h \
 	upstream.c upstream.h \
+	basicauth.c basicauth.h \
+	base64.c base64.h \
+	sblist.c sblist.h \
+	hsearch.c hsearch.h \
+	orderedmap.c orderedmap.h \
+	loop.c loop.h \
+	mypoll.c mypoll.h \
 	connect-ports.c connect-ports.h
 
 EXTRA_tinyproxy_SOURCES = filter.c filter.h \
 	reverse-proxy.c reverse-proxy.h \
 	transparent-proxy.c transparent-proxy.h
 tinyproxy_DEPENDENCIES = @ADDITIONAL_OBJECTS@
-tinyproxy_LDADD = @ADDITIONAL_OBJECTS@
+tinyproxy_LDADD = @ADDITIONAL_OBJECTS@ -lpthread
 
-EXTRA_DIST = \
-	authors.xsl
-
-authors.c: $(top_srcdir)/authors.xml $(srcdir)/authors.xsl
-if HAVE_XSLTPROC
-	$(AM_V_GEN) $(XSLTPROC) $(srcdir)/authors.xsl $< > $(@) || rm -f $(@)
-else
-        @echo "*** xsltproc is required to regenerate $(@) ***"; exit 1;
+if HAVE_GPERF
+conf-tokens.c: conf-tokens-gperf.inc
+conf-tokens-gperf.inc: conf-tokens.gperf
+	$(GPERF) $< > $@
 endif
-
-BUILT_SOURCES = \
-	authors.c

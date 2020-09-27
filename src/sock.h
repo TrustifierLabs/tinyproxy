@@ -28,15 +28,35 @@
 
 #define MAXLINE (1024 * 4)
 
-#include "vector.h"
+#include "common.h"
+#include "sblist.h"
+
+#define SOCKADDR_UNION_AF(PTR) (PTR)->v4.sin_family
+
+#define SOCKADDR_UNION_LENGTH(PTR) ( \
+	( SOCKADDR_UNION_AF(PTR) == AF_INET  ) ? sizeof((PTR)->v4) : ( \
+	( SOCKADDR_UNION_AF(PTR) == AF_INET6 ) ? sizeof((PTR)->v6) : 0 ) )
+
+#define SOCKADDR_UNION_ADDRESS(PTR) ( \
+	( SOCKADDR_UNION_AF(PTR) == AF_INET  ) ? (void*) &(PTR)->v4.sin_addr  : ( \
+	( SOCKADDR_UNION_AF(PTR) == AF_INET6 ) ? (void*) &(PTR)->v6.sin6_addr : (void*) 0 ) )
+
+#define SOCKADDR_UNION_PORT(PTR) ( \
+	( SOCKADDR_UNION_AF(PTR) == AF_INET  ) ? (PTR)->v4.sin_port  : ( \
+	( SOCKADDR_UNION_AF(PTR) == AF_INET6 ) ? (PTR)->v6.sin6_port : 0 ) )
+
+union sockaddr_union {
+        struct sockaddr_in  v4;
+        struct sockaddr_in6 v6;
+};
 
 extern int opensock (const char *host, int port, const char *bind_to);
-extern int listen_sock (const char *addr, uint16_t port, vector_t listen_fds);
+extern int listen_sock (const char *addr, uint16_t port, sblist* listen_fds);
 
 extern int socket_nonblocking (int sock);
 extern int socket_blocking (int sock);
 
 extern int getsock_ip (int fd, char *ipaddr);
-extern int getpeer_information (int fd, char *ipaddr, char *string_addr);
+extern void getpeer_information (union sockaddr_union *addr, char *ipaddr, size_t ipaddr_len);
 
 #endif

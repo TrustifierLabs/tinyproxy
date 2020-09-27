@@ -32,13 +32,13 @@
 #include "main.h"
 
 #include "anonymous.h"
-#include "authors.h"
 #include "buffer.h"
 #include "conf.h"
 #include "daemon.h"
 #include "heap.h"
 #include "filter.h"
 #include "child.h"
+#include "loop.h"
 #include "log.h"
 #include "reqs.h"
 #include "sock.h"
@@ -48,9 +48,17 @@
 /*
  * Global Structures
  */
-struct config_s config;
-struct config_s config_defaults;
+struct config_s *config;
+static struct config_s configs[2];
+static const char* config_file;
 unsigned int received_sighup = FALSE;   /* boolean */
+
+static struct config_s*
+get_next_config(void)
+{
+        if (config == &configs[0]) return &configs[1];
+        return &configs[0];
+}
 
 /*
  * Handle a signal
@@ -62,12 +70,14 @@ takesig (int sig)
         int status;
 
         switch (sig) {
+        case SIGUSR1:
         case SIGHUP:
                 received_sighup = TRUE;
                 break;
 
+        case SIGINT:
         case SIGTERM:
-                config.quit = TRUE;
+                config->quit = TRUE;
                 break;
 
         case SIGCHLD:
@@ -88,55 +98,6 @@ display_version (void)
 }
 
 /*
- * Display the copyright and license for this program.
- */
-static void
-display_license (void)
-{
-        const char * const *authors;
-        const char * const *documenters;
-
-        display_version ();
-
-        printf ("\
-\n\
-  Copyright 1998       Steven Young (sdyoung@well.com)\n\
-  Copyright 1998-2002  Robert James Kaes (rjkaes@users.sourceforge.net)\n\
-  Copyright 1999       George Talusan (gstalusan@uwaterloo.ca)\n\
-  Copyright 2000       Chris Lightfoot (chris@ex-parrot.com)\n\
-  Copyright 2009-2010  Mukund Sivaraman (muks@banu.com)\n\
-  Copyright 2009-2010  Michael Adam (obnox@samba.org)\n\
-\n\
-  This program is free software; you can redistribute it and/or modify\n\
-  it under the terms of the GNU General Public License as published by\n\
-  the Free Software Foundation; either version 2, or (at your option)\n\
-  any later version.\n\
-\n\
-  This program is distributed in the hope that it will be useful,\n\
-  but WITHOUT ANY WARRANTY; without even the implied warranty of\n\
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the\n\
-  GNU General Public License for more details.\n\
-\n\
-  You should have received a copy of the GNU General Public License\n\
-  along with this program; if not, write to the Free Software\n\
-  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307, USA.\n\
-\n");
-
-        printf ("\nAUTHORS:\n");
-        for (authors = authors_get_authors (); *authors; authors++) {
-                printf ("  %s\n", *authors);
-        }
-
-        printf ("\nDOCUMENTERS:\n");
-        for (documenters = authors_get_documenters ();
-             *documenters; documenters++) {
-                printf ("  %s\n", *documenters);
-        }
-
-        printf ("\n");
-}
-
-/*
  * Display usage to the user.
  */
 static void
@@ -150,7 +111,6 @@ display_usage (void)
                 "  -d        Do not daemonize (run in foreground).\n"
                 "  -c FILE   Use an alternate configuration file.\n"
                 "  -h        Display this usage information.\n"
-                "  -l        Display the license.\n"
                 "  -v        Display version information.\n");
 
         /* Display the modes compiled into tinyproxy */
@@ -213,56 +173,6 @@ get_id (char *str)
 }
 
 /**
- * process_cmdline:
- * @argc: argc as passed to main()
- * @argv: argv as passed to main()
- *
- * This function parses command line arguments.
- **/
-static void
-process_cmdline (int argc, char **argv, struct config_s *conf)
-{
-        int opt;
-
-        while ((opt = getopt (argc, argv, "c:vldh")) != EOF) {
-                switch (opt) {
-                case 'v':
-                        display_version ();
-                        exit (EX_OK);
-
-                case 'l':
-                        display_license ();
-                        exit (EX_OK);
-
-                case 'd':
-                        conf->godaemon = FALSE;
-                        break;
-
-                case 'c':
-                        if (conf->config_file != NULL) {
-                                safefree (conf->config_file);
-                        }
-                        conf->config_file = safestrdup (optarg);
-                        if (!conf->config_file) {
-                                fprintf (stderr,
-                                         "%s: Could not allocate memory.\n",
-                                         argv[0]);
-                                exit (EX_SOFTWARE);
-                        }
-                        break;
-
-                case 'h':
-                        display_usage ();
-                        exit (EX_OK);
-
-                default:
-                        display_usage ();
-                        exit (EX_USAGE);
-                }
-        }
-}
-
-/**
  * change_user:
  * @program: The name of the program. Pass argv[0] here.
  *
@@ -273,16 +183,16 @@ process_cmdline (int argc, char **argv, struct config_s *conf)
 static void
 change_user (const char *program)
 {
-        if (config.group && strlen (config.group) > 0) {
-                int gid = get_id (config.group);
+        if (config->group && strlen (config->group) > 0) {
+                int gid = get_id (config->group);
 
                 if (gid < 0) {
-                        struct group *thisgroup = getgrnam (config.group);
+                        struct group *thisgroup = getgrnam (config->group);
 
                         if (!thisgroup) {
                                 fprintf (stderr,
                                          "%s: Unable to find group \"%s\".\n",
-                                         program, config.group);
+                                         program, config->group);
                                 exit (EX_NOUSER);
                         }
 
@@ -292,7 +202,7 @@ change_user (const char *program)
                 if (setgid (gid) < 0) {
                         fprintf (stderr,
                                  "%s: Unable to change to group \"%s\".\n",
-                                 program, config.group);
+                                 program, config->group);
                         exit (EX_NOPERM);
                 }
 
@@ -307,19 +217,19 @@ change_user (const char *program)
 #endif
 
                 log_message (LOG_INFO, "Now running as group \"%s\".",
-                             config.group);
+                             config->group);
         }
 
-        if (config.user && strlen (config.user) > 0) {
-                int uid = get_id (config.user);
+        if (config->user && strlen (config->user) > 0) {
+                int uid = get_id (config->user);
 
                 if (uid < 0) {
-                        struct passwd *thisuser = getpwnam (config.user);
+                        struct passwd *thisuser = getpwnam (config->user);
 
                         if (!thisuser) {
                                 fprintf (stderr,
                                          "%s: Unable to find user \"%s\".\n",
-                                         program, config.user);
+                                         program, config->user);
                                 exit (EX_NOUSER);
                         }
 
@@ -329,78 +239,99 @@ change_user (const char *program)
                 if (setuid (uid) < 0) {
                         fprintf (stderr,
                                  "%s: Unable to change to user \"%s\".\n",
-                                 program, config.user);
+                                 program, config->user);
                         exit (EX_NOPERM);
                 }
 
                 log_message (LOG_INFO, "Now running as user \"%s\".",
-                             config.user);
+                             config->user);
         }
-}
-
-static void initialize_config_defaults (struct config_s *conf)
-{
-        memset (conf, 0, sizeof(*conf));
-
-        conf->config_file = safestrdup (SYSCONFDIR "/tinyproxy.conf");
-        if (!conf->config_file) {
-                fprintf (stderr, PACKAGE ": Could not allocate memory.\n");
-                exit (EX_SOFTWARE);
-        }
-        conf->godaemon = TRUE;
-        /*
-         * Make sure the HTML error pages array is NULL to begin with.
-         * (FIXME: Should have a better API for all this)
-         */
-        conf->errorpages = NULL;
-        conf->stathost = safestrdup (TINYPROXY_STATHOST);
-        conf->idletimeout = MAX_IDLE_TIME;
-        conf->logf_name = safestrdup (LOCALSTATEDIR "/log/tinyproxy/tinyproxy.log");
-        conf->pidpath = safestrdup (LOCALSTATEDIR "/run/tinyproxy/tinyproxy.pid");
 }
 
 /**
  * convenience wrapper around reload_config_file
  * that also re-initializes logging.
  */
-int reload_config (void)
+int reload_config (int reload_logging)
 {
         int ret;
+        struct config_s *c_next = get_next_config();
 
-        shutdown_logging ();
+        log_message (LOG_NOTICE, "Reloading config file");
 
-        ret = reload_config_file (config_defaults.config_file, &config,
-                                  &config_defaults);
+        if (reload_logging) shutdown_logging ();
+
+        ret = reload_config_file (config_file, c_next);
+
         if (ret != 0) {
                 goto done;
         }
 
-        ret = setup_logging ();
+        if(config) free_config (config);
+        config = c_next;
+
+        if (reload_logging) ret = setup_logging ();
+        log_message (LOG_NOTICE, "Reloading config file finished");
 
 done:
         return ret;
 }
 
+static void setup_sig(int sig, signal_func *sigh,
+                     const char* signame, const char* argv0) {
+        if (set_signal_handler (sig, sigh) == SIG_ERR) {
+                fprintf (stderr, "%s: Could not set the \"%s\" signal.\n",
+                         argv0, signame);
+                exit (EX_OSERR);
+        }
+}
+
 int
 main (int argc, char **argv)
 {
+        int opt, daemonized = TRUE;
+
+        srand(time(NULL)); /* for hashmap seeds */
+
         /* Only allow u+rw bits. This may be required for some versions
          * of glibc so that mkstemp() doesn't make us vulnerable.
          */
         umask (0177);
 
-        log_message (LOG_INFO, "Initializing " PACKAGE " ...");
+        log_message (LOG_NOTICE, "Initializing " PACKAGE " ...");
 
-        if (config_compile_regex()) {
+        if (config_init()) {
+                fprintf(stderr, "ERROR: config_init() failed\n");
                 exit (EX_SOFTWARE);
         }
 
-        initialize_config_defaults (&config_defaults);
-        process_cmdline (argc, argv, &config_defaults);
+        config_file = SYSCONFDIR "/tinyproxy.conf";
 
-        if (reload_config_file (config_defaults.config_file,
-                                &config,
-                                &config_defaults)) {
+        while ((opt = getopt (argc, argv, "c:vdh")) != EOF) {
+                switch (opt) {
+                case 'v':
+                        display_version ();
+                        exit (EX_OK);
+
+                case 'd':
+                        daemonized = FALSE;
+                        break;
+
+                case 'c':
+                        config_file = optarg;
+                        break;
+
+                case 'h':
+                        display_usage ();
+                        exit (EX_OK);
+
+                default:
+                        display_usage ();
+                        exit (EX_USAGE);
+                }
+        }
+
+        if (reload_config(0)) {
                 exit (EX_SOFTWARE);
         }
 
@@ -410,30 +341,40 @@ main (int argc, char **argv)
          * in the list of allowed headers, since it is required in a
          * HTTP/1.0 request. Also add the Content-Type header since it
          * goes hand in hand with Content-Length. */
-        if (is_anonymous_enabled ()) {
-                anonymous_insert ("Content-Length");
-                anonymous_insert ("Content-Type");
+        if (is_anonymous_enabled (config)) {
+                anonymous_insert (config, safestrdup("Content-Length"));
+                anonymous_insert (config, safestrdup("Content-Type"));
         }
 
-        if (config.godaemon == TRUE)
+        if (daemonized == TRUE) {
+                if (!config->syslog && config->logf_name == NULL)
+                        fprintf(stderr, "WARNING: logging deactivated "
+                                "(can't log to stdout when daemonized)\n");
+
                 makedaemon ();
-
-        if (set_signal_handler (SIGPIPE, SIG_IGN) == SIG_ERR) {
-                fprintf (stderr, "%s: Could not set the \"SIGPIPE\" signal.\n",
-                         argv[0]);
-                exit (EX_OSERR);
         }
+
+        setup_sig(SIGPIPE, SIG_IGN, "SIGPIPE", argv[0]);
 
 #ifdef FILTER_ENABLE
-        if (config.filter)
+        if (config->filter)
                 filter_init ();
 #endif /* FILTER_ENABLE */
 
         /* Start listening on the selected port. */
-        if (child_listening_sockets(config.listen_addrs, config.port) < 0) {
+        if (child_listening_sockets(config->listen_addrs, config->port) < 0) {
                 fprintf (stderr, "%s: Could not create listening sockets.\n",
                          argv[0]);
                 exit (EX_OSERR);
+        }
+
+        /* Create pid file before we drop privileges */
+        if (config->pidpath) {
+                if (pidfile_create (config->pidpath) < 0) {
+                        fprintf (stderr, "%s: Could not create PID file.\n",
+                                 argv[0]);
+                        exit (EX_OSERR);
+                }
         }
 
         /* Switch to a different user if we're running as root */
@@ -448,64 +389,43 @@ main (int argc, char **argv)
                 exit (EX_SOFTWARE);
         }
 
-        /* Create pid file after we drop privileges */
-        if (config.pidpath) {
-                if (pidfile_create (config.pidpath) < 0) {
-                        fprintf (stderr, "%s: Could not create PID file.\n",
-                                 argv[0]);
-                        exit (EX_OSERR);
-                }
-        }
-
-        if (child_pool_create () < 0) {
-                fprintf (stderr,
-                         "%s: Could not create the pool of children.\n",
-                         argv[0]);
-                exit (EX_SOFTWARE);
-        }
-
         /* These signals are only for the parent process. */
         log_message (LOG_INFO, "Setting the various signals.");
 
-        if (set_signal_handler (SIGCHLD, takesig) == SIG_ERR) {
-                fprintf (stderr, "%s: Could not set the \"SIGCHLD\" signal.\n",
-                         argv[0]);
-                exit (EX_OSERR);
-        }
+        setup_sig (SIGCHLD, takesig, "SIGCHLD", argv[0]);
+        setup_sig (SIGTERM, takesig, "SIGTERM", argv[0]);
+        setup_sig (SIGINT, takesig, "SIGINT", argv[0]);
+        if (daemonized) setup_sig (SIGHUP, takesig, "SIGHUP", argv[0]);
+        setup_sig (SIGUSR1, takesig, "SIGUSR1", argv[0]);
 
-        if (set_signal_handler (SIGTERM, takesig) == SIG_ERR) {
-                fprintf (stderr, "%s: Could not set the \"SIGTERM\" signal.\n",
-                         argv[0]);
-                exit (EX_OSERR);
-        }
-
-        if (set_signal_handler (SIGHUP, takesig) == SIG_ERR) {
-                fprintf (stderr, "%s: Could not set the \"SIGHUP\" signal.\n",
-                         argv[0]);
-                exit (EX_OSERR);
-        }
+        loop_records_init();
 
         /* Start the main loop */
         log_message (LOG_INFO, "Starting main loop. Accepting connections.");
 
         child_main_loop ();
 
-        log_message (LOG_INFO, "Shutting down.");
+        log_message (LOG_NOTICE, "Shutting down.");
 
         child_kill_children (SIGTERM);
         child_close_sock ();
+        child_free_children();
+
+        loop_records_destroy();
 
         /* Remove the PID file */
-        if (unlink (config.pidpath) < 0) {
+        if (config->pidpath != NULL && unlink (config->pidpath) < 0) {
                 log_message (LOG_WARNING,
                              "Could not remove PID file \"%s\": %s.",
-                             config.pidpath, strerror (errno));
+                             config->pidpath, strerror (errno));
         }
 
 #ifdef FILTER_ENABLE
-        if (config.filter)
+        if (config->filter)
                 filter_destroy ();
 #endif /* FILTER_ENABLE */
+
+        free_config (config);
 
         shutdown_logging ();
 

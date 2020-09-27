@@ -45,7 +45,7 @@ static int build_url (char **url, const char *host, int port, const char *path)
         assert (path != NULL);
 
         len = strlen (host) + strlen (path) + 14;
-        *url = (char *) safemalloc (len);
+        *url = (char *) saferealloc (*url, len);
         if (*url == NULL)
                 return -1;
 
@@ -53,22 +53,27 @@ static int build_url (char **url, const char *host, int port, const char *path)
 }
 
 int
-do_transparent_proxy (struct conn_s *connptr, hashmap_t hashofheaders,
+do_transparent_proxy (struct conn_s *connptr, orderedmap hashofheaders,
                       struct request_s *request, struct config_s *conf,
                       char **url)
 {
         socklen_t length;
         char *data;
         size_t ulen = strlen (*url);
-        ssize_t i;
+        size_t i;
 
-        length = hashmap_entry_by_key (hashofheaders, "host", (void **) &data);
-        if (length <= 0) {
-                struct sockaddr_in dest_addr;
+        data = orderedmap_find (hashofheaders, "host");
+        if (!data) {
+                union sockaddr_union dest_addr;
+                const void *dest_inaddr;
+                char namebuf[INET6_ADDRSTRLEN+1];
+                int af;
+                length = sizeof(dest_addr);
 
                 if (getsockname
-                    (connptr->client_fd, (struct sockaddr *) &dest_addr,
-                     &length) < 0) {
+                    (connptr->client_fd, (void *) &dest_addr,
+                     &length) < 0 || length > sizeof(dest_addr)) {
+                addr_err:;
                         log_message (LOG_ERR,
                                      "process_request: cannot get destination IP for %d",
                                      connptr->client_fd);
@@ -78,10 +83,14 @@ do_transparent_proxy (struct conn_s *connptr, hashmap_t hashofheaders,
                         return 0;
                 }
 
-                request->host = (char *) safemalloc (17);
-                strlcpy (request->host, inet_ntoa (dest_addr.sin_addr), 17);
+                af = SOCKADDR_UNION_AF(&dest_addr);
+                dest_inaddr = SOCKADDR_UNION_ADDRESS(&dest_addr);
 
-                request->port = ntohs (dest_addr.sin_port);
+                if (!inet_ntop(af, dest_inaddr, namebuf, sizeof namebuf))
+                        goto addr_err;
+
+                request->host = safestrdup (namebuf);
+                request->port = ntohs (SOCKADDR_UNION_PORT(&dest_addr));
 
                 request->path = (char *) safemalloc (ulen + 1);
                 strlcpy (request->path, *url, ulen + 1);
@@ -91,6 +100,7 @@ do_transparent_proxy (struct conn_s *connptr, hashmap_t hashofheaders,
                              "process_request: trans IP %s %s for %d",
                              request->method, *url, connptr->client_fd);
         } else {
+                length = strlen (data);
                 request->host = (char *) safemalloc (length + 1);
                 if (sscanf (data, "%[^:]:%hu", request->host, &request->port) !=
                     2) {
@@ -111,12 +121,12 @@ do_transparent_proxy (struct conn_s *connptr, hashmap_t hashofheaders,
                 return 1;
         }
 
-        for (i = 0; i < vector_length(conf->listen_addrs); i++) {
-                const char *addr;
+        for (i = 0; i < sblist_getsize(conf->listen_addrs); i++) {
+                char **addr;
 
-                addr = (char *)vector_getentry(conf->listen_addrs, i, NULL);
+                addr = sblist_get(conf->listen_addrs, i);
 
-                if (addr && strcmp(request->host, addr) == 0) {
+                if (addr && *addr && strcmp(request->host, *addr) == 0) {
                         log_message(LOG_ERR,
                                     "transparent: destination IP %s is local "
                                     "on socket fd %d",

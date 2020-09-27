@@ -27,8 +27,9 @@
 #include "heap.h"
 #include "log.h"
 #include "utils.h"
-#include "vector.h"
+#include "sblist.h"
 #include "conf.h"
+#include <pthread.h>
 
 static const char *syslog_level[] = {
         NULL,
@@ -44,6 +45,8 @@ static const char *syslog_level[] = {
 
 #define TIME_LENGTH 16
 #define STRING_LENGTH 800
+
+static pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /*
  * Global file descriptor for the log file
@@ -61,7 +64,7 @@ static int log_level = LOG_INFO;
  * The key is the actual messages (already filled in full), and the value
  * is the log level.
  */
-static vector_t log_message_storage;
+static sblist *log_message_storage;
 
 static unsigned int logging_initialized = FALSE;     /* boolean */
 
@@ -70,7 +73,11 @@ static unsigned int logging_initialized = FALSE;     /* boolean */
  */
 int open_log_file (const char *log_file_name)
 {
-        log_file_fd = create_file_safely (log_file_name, FALSE);
+        if (log_file_name == NULL) {
+                log_file_fd = fileno(stdout);
+        } else {
+                log_file_fd = create_file_safely (log_file_name, FALSE);
+        }
         return log_file_fd;
 }
 
@@ -79,7 +86,7 @@ int open_log_file (const char *log_file_name)
  */
 void close_log_file (void)
 {
-        if (log_file_fd < 0) {
+        if (log_file_fd < 0 || log_file_fd == fileno(stdout)) {
                 return;
         }
 
@@ -122,7 +129,7 @@ void log_message (int level, const char *fmt, ...)
                 return;
 #endif
 
-        if (config.syslog && level == LOG_CONN)
+        if (config && config->syslog && level == LOG_CONN)
                 level = LOG_INFO;
 
         va_start (args, fmt);
@@ -135,7 +142,7 @@ void log_message (int level, const char *fmt, ...)
                 char *entry_buffer;
 
                 if (!log_message_storage) {
-                        log_message_storage = vector_create ();
+                        log_message_storage = sblist_new (sizeof(char*), 64);
                         if (!log_message_storage)
                                 goto out;
                 }
@@ -147,20 +154,23 @@ void log_message (int level, const char *fmt, ...)
                         goto out;
 
                 sprintf (entry_buffer, "%d %s", level, str);
-                vector_append (log_message_storage, entry_buffer,
-                               strlen (entry_buffer) + 1);
-
-                safefree (entry_buffer);
+                if(!sblist_add (log_message_storage, &entry_buffer))
+                        safefree (entry_buffer);
                 goto out;
         }
 
-        if (config.syslog) {
+        if(!config->syslog && log_file_fd == -1)
+                goto out;
+
+        if (config->syslog) {
+                pthread_mutex_lock(&log_mutex);
 #ifdef HAVE_VSYSLOG_H
                 vsyslog (level, fmt, args);
 #else
                 vsnprintf (str, STRING_LENGTH, fmt, args);
                 syslog (level, "%s", str);
 #endif
+                pthread_mutex_unlock(&log_mutex);
         } else {
                 char *p;
 
@@ -186,18 +196,24 @@ void log_message (int level, const char *fmt, ...)
 
                 assert (log_file_fd >= 0);
 
+                pthread_mutex_lock(&log_mutex);
                 ret = write (log_file_fd, str, strlen (str));
+                pthread_mutex_unlock(&log_mutex);
+
                 if (ret == -1) {
-                        config.syslog = TRUE;
+                        config->syslog = TRUE;
 
                         log_message(LOG_CRIT, "ERROR: Could not write to log "
                                     "file %s: %s.",
-                                    config.logf_name, strerror(errno));
+                                    config->logf_name, strerror(errno));
                         log_message(LOG_CRIT,
                                     "Falling back to syslog logging");
                 }
 
+                pthread_mutex_lock(&log_mutex);
                 fsync (log_file_fd);
+                pthread_mutex_unlock(&log_mutex);
+
         }
 
 out:
@@ -207,9 +223,9 @@ out:
 /*
  * This needs to send any stored log messages.
  */
-void send_stored_logs (void)
+static void send_stored_logs (void)
 {
-        char *string;
+        char **string;
         char *ptr;
         int level;
         size_t i;
@@ -219,12 +235,12 @@ void send_stored_logs (void)
 
         log_message(LOG_DEBUG, "sending stored logs");
 
-        for (i = 0; (ssize_t) i != vector_length (log_message_storage); ++i) {
-                string =
-                    (char *) vector_getentry (log_message_storage, i, NULL);
+        for (i = 0; i < sblist_getsize (log_message_storage); ++i) {
+                string = sblist_get (log_message_storage, i);
+                if (!string || !*string) continue;
 
-                ptr = strchr (string, ' ') + 1;
-                level = atoi (string);
+                ptr = strchr (*string, ' ') + 1;
+                level = atoi (*string);
 
 #ifdef NDEBUG
                 if (log_level == LOG_CONN && level == LOG_INFO)
@@ -237,9 +253,10 @@ void send_stored_logs (void)
 #endif
 
                 log_message (level, "%s", ptr);
+                safefree(*string);
         }
 
-        vector_delete (log_message_storage);
+        sblist_free (log_message_storage);
         log_message_storage = NULL;
 
         log_message(LOG_DEBUG, "done sending stored logs");
@@ -254,27 +271,24 @@ void send_stored_logs (void)
  */
 int setup_logging (void)
 {
-        if (!config.syslog) {
-                if (open_log_file (config.logf_name) < 0) {
+        if (!config->syslog) {
+                if (open_log_file (config->logf_name) < 0) {
                         /*
                          * If opening the log file fails, we try
                          * to fall back to syslog logging...
                          */
-                        config.syslog = TRUE;
+                        config->syslog = TRUE;
 
                         log_message (LOG_CRIT, "ERROR: Could not create log "
                                      "file %s: %s.",
-                                     config.logf_name, strerror (errno));
+                                     config->logf_name, strerror (errno));
                         log_message (LOG_CRIT,
                                      "Falling back to syslog logging.");
                 }
         }
 
-        if (config.syslog) {
-                if (config.godaemon == TRUE)
-                        openlog ("tinyproxy", LOG_PID, LOG_DAEMON);
-                else
-                        openlog ("tinyproxy", LOG_PID, LOG_USER);
+        if (config->syslog) {
+                openlog ("tinyproxy", LOG_PID, LOG_USER);
         }
 
         logging_initialized = TRUE;
@@ -292,7 +306,7 @@ void shutdown_logging (void)
                 return;
         }
 
-        if (config.syslog) {
+        if (config->syslog) {
                 closelog ();
         } else {
                 close_log_file ();
